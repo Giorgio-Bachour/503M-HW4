@@ -1,37 +1,46 @@
 import secrets
 from datetime import timedelta
 
-from flask import Blueprint, redirect, render_template, request
-from flask_login import current_user, login_required, login_user, logout_user
+from flask import Blueprint, redirect, render_template, request, session
+from flask_login import current_user, login_user, logout_user
 
 from .models import Mail, ResetToken, User, db, utcnow
+from .policy import authenticated, public
 
 bp = Blueprint("auth", __name__)
 
 
+def _new_csrf_token():
+    # Step 22: a fresh, unguessable token at every login. Any token from before
+    # the login is thrown away, so a pre-login token cannot be reused after it.
+    session["csrf_token"] = secrets.token_urlsafe(32)
+
+
 @bp.route("/login", methods=["GET", "POST"])
+@public
 def login():
     error = None
     if request.method == "POST":
         user = User.query.filter_by(username=request.form.get("username", "")).first()
         if user and user.check_password(request.form.get("password", "")):
+            session.clear()          # drop any pre-login session state
             login_user(user)
-            resp = redirect("/")
-            resp.set_cookie("role", user.role)  # pages read the role from here
-            return resp
+            _new_csrf_token()
+            return redirect("/")
         error = "Invalid username or password."
     return render_template("login.html", error=error), (401 if error else 200)
 
 
 @bp.get("/logout")
+@public
 def logout():
     logout_user()
-    resp = redirect("/login")
-    resp.delete_cookie("role")
-    return resp
+    session.clear()
+    return redirect("/login")
 
 
 @bp.route("/forgot", methods=["GET", "POST"])
+@public
 def forgot():
     sent = False
     if request.method == "POST":
@@ -50,6 +59,7 @@ def forgot():
 
 
 @bp.route("/reset", methods=["GET", "POST"])
+@public
 def reset():
     token = request.args.get("token", "")
     rt = db.session.get(ResetToken, token) if token else None
@@ -69,7 +79,7 @@ def reset():
 
 
 @bp.get("/inbox")
-@login_required
+@authenticated
 def inbox():
     mails = (Mail.query.filter_by(to_address=current_user.email)
              .order_by(Mail.sent_at.desc(), Mail.id.desc()).all())

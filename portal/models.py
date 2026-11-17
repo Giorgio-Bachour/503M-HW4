@@ -96,6 +96,14 @@ class Submission(db.Model):
         return self.assignment.course
 
 
+class Extension(db.Model):
+    """N2: an approved late-submission extension for one student on one
+    assignment. This is the new fact the portal did not store before."""
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), primary_key=True)
+    assignment_id = db.Column(db.Integer, db.ForeignKey("assignment.id"), primary_key=True)
+    approved = db.Column(db.Boolean, nullable=False, default=True)
+
+
 class Mail(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     to_address = db.Column(db.String(120), nullable=False)

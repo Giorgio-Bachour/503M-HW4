@@ -1,14 +1,27 @@
 from markupsafe import escape
-from flask import Blueprint, abort, render_template, request
-from flask_login import current_user, login_required
+from flask import Blueprint, render_template, request
+from flask_login import current_user
 
-from .models import Assignment, Course, Submission, db, utcnow
+from .models import Assignment, Course, Submission, db
+from .policy import authenticated, requires
 
 bp = Blueprint("courses", __name__)
 
 
+def _course():
+    return db.session.get(Course, request.view_args["cid"])
+
+
+def _assignment():
+    return db.session.get(Assignment, request.view_args["aid"])
+
+
+def _submission():
+    return db.session.get(Submission, request.view_args["sid"])
+
+
 @bp.get("/")
-@login_required
+@authenticated
 def dashboard():
     ids = current_user.enrolled_in | current_user.staff_of
     courses = Course.query.filter(Course.id.in_(ids)).all() if ids else []
@@ -16,21 +29,15 @@ def dashboard():
 
 
 @bp.get("/courses/<int:cid>/materials")
-@login_required
+@requires("view_material", load=_course)
 def materials(cid):
-    if cid not in current_user.enrolled_in and cid not in current_user.staff_of:
-        abort(403)
     return render_template("materials.html", course=db.get_or_404(Course, cid))
 
 
 @bp.post("/assignments/<int:aid>/submit")
-@login_required
+@requires("submit", load=_assignment)
 def submit(aid):
     assignment = db.get_or_404(Assignment, aid)
-    if assignment.course_id not in current_user.enrolled_in:
-        abort(403)
-    if utcnow() >= assignment.deadline:
-        abort(403)
     sub = Submission.query.filter_by(assignment_id=aid, student_id=current_user.id).first()
     if sub is None:
         sub = Submission(assignment_id=aid, student_id=current_user.id)
@@ -41,44 +48,34 @@ def submit(aid):
 
 
 @bp.get("/submissions/<int:sid>")
-@login_required
+@requires("view_submission", load=_submission)
 def view_submission(sid):
-    sub = Submission.query.get_or_404(sid)
+    sub = db.get_or_404(Submission, sid)
     return render_template("submission.html", sub=sub)
 
 
 @bp.post("/submissions/<int:sid>/grade")
-@login_required
+@requires("grade", load=_submission)
 def grade(sid):
     sub = db.get_or_404(Submission, sid)
-    if current_user.role not in ("ta", "instructor"):
-        abort(403)
-    if sub.course_id not in current_user.staff_of:
-        abort(403)
-    if sub.released:
-        abort(403)
     sub.grade = request.form.get("grade")
     db.session.commit()
     return f"Grade for submission {sub.id} set to {escape(sub.grade)}."
 
 
 @bp.post("/submissions/<int:sid>/change")
-@login_required
+@requires("change_grade", load=_submission)
 def change(sid):
     sub = db.get_or_404(Submission, sid)
-    if current_user.role != "instructor":
-        abort(403)
-    if sub.course_id not in current_user.teaches:
-        abort(403)
-    if not sub.released:
-        abort(403)
     return render_template("change_confirm.html", sub=sub,
                            grade=request.form.get("grade"))
 
 
 @bp.post("/submissions/<int:sid>/change/confirm")
-@login_required
+@requires("change_grade", load=_submission)
 def change_confirm(sid):
+    # Step 2 re-checks the permission itself (via the hook): it no longer
+    # assumes step 1 already authorised the change (attack 6).
     sub = db.get_or_404(Submission, sid)
     if request.form.get("confirmed") == "true":
         sub.grade = request.form.get("grade")
@@ -88,10 +85,9 @@ def change_confirm(sid):
 
 
 @bp.get("/gradebook/<int:cid>")
+@requires("view_gradebook", load=_course)
 def gradebook(cid):
-    role = request.cookies.get("role", "student")
-    if role not in ("ta", "instructor"):
-        abort(403)
+    # The role no longer comes from a client cookie (attack 2); the hook decided.
     course = db.get_or_404(Course, cid)
     subs = (Submission.query.join(Assignment)
             .filter(Assignment.course_id == cid).all())
